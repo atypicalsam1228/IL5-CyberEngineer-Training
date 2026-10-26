@@ -1,0 +1,41 @@
+# Tool versions baked into il5-lab-tools. ASCII only. Checked against vendor pages on 2026-10-26.
+# Format: tool | version | download source | integrity check | arm64
+# Every sha256 is pinned in checksums.sha256 and verified in the Dockerfile at build time.
+# To update a tool: change the ARG in Dockerfile, edit the matching rows in checksums.sha256
+# from the vendor checksum file named below, then update this file.
+
+base image | ubi9/ubi-minimal 9.8 | registry.access.redhat.com/ubi9/ubi-minimal:9.8 | UNPINNED tag (digest not confirmed here; pin a digest for release builds) | yes (multi-arch)
+oc | 4.22.18 | https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.22.18/openshift-client-linux-<arch>-rhel9-4.22.18.tar.gz | sha256 from .../4.22.18/sha256sum.txt (Red Hat mirror) | yes
+kubectl | 4.22.18 (shipped in the oc tarball) | same tarball as oc | same as oc | yes
+terraform | 1.17.0 | https://releases.hashicorp.com/terraform/1.17.0/terraform_1.17.0_linux_<arch>.zip | sha256 from terraform_1.17.0_SHA256SUMS (a .sig exists; the Dockerfile pins the sha256 instead of checking the sig) | yes
+aws (AWS CLI v2) | 2.38.5 | https://awscli.amazonaws.com/awscli-exe-linux-<x86_64 or aarch64>-2.38.5.zip | GPG signature (.sig) verified against aws-cli-public-key.asc (fingerprint FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C, key expires 2027-07-01) plus pinned sha256 | yes
+session-manager-plugin | 1.2.896.0 | https://s3.amazonaws.com/session-manager-downloads/plugin/1.2.896.0/<linux_64bit or linux_arm64>/session-manager-plugin.rpm | pinned sha256 (computed from the vendor download; AWS publishes no checksum file; a .rpm.sig exists but is not checked) | yes
+cosign | 3.1.4 | https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-<arch> | sha256 from cosign_checksums.txt in the same release | yes
+trivy | 0.76.1 | https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-<64bit or ARM64>.tar.gz | sha256 from trivy_0.76.1_checksums.txt in the same release | yes
+argocd | 3.5.6 | https://github.com/argoproj/argo-cd/releases/download/v3.5.6/argocd-linux-<arch> | sha256 from cli_checksums.txt in the same release | yes
+velero | 1.18.4 | https://github.com/velero-io/velero/releases/download/v1.18.4/velero-v1.18.4-linux-<arch>.tar.gz | sha256 from CHECKSUM in the same release | yes. NOTE: client minor 1.18 chosen to match the OADP 1.6 Velero server (OKD 4.22 docs: server moved 1.16 to 1.18); the exact server patch version is UNCONFIRMED. Repo moved from vmware-tanzu/velero to velero-io/velero.
+tkn | 0.46.2 | https://github.com/tektoncd/cli/releases/download/v0.46.2/tkn_0.46.2_Linux_<x86_64 or aarch64>.tar.gz | sha256 from checksums.txt in the same release | yes
+kustomize | 5.8.3 | https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.3/kustomize_v5.8.3_linux_<arch>.tar.gz | sha256 from checksums.txt in the same release | yes. NOTE: listed in LAB-CONTRACT.md but no module code block calls it.
+
+# OS packages from the Red Hat UBI 9 repositories (no version pin; they follow the base image tag).
+# Presence of each package in the UBI repos was NOT confirmed by an image build (no running engine when written).
+bash | UBI package (in base) | microdnf | rpm signature by Red Hat | yes
+git | UBI package | microdnf | rpm signature | yes
+curl | UBI package (curl-minimal in base) | microdnf | rpm signature | yes
+jq | UBI package | microdnf | rpm signature | yes
+openssl | UBI package | microdnf | rpm signature | yes
+ssh, ssh-keygen, scp | UBI package openssh-clients | microdnf | rpm signature | yes
+python3 | UBI package python3 (3.9 in RHEL 9) | microdnf | rpm signature | yes
+PyYAML | UBI package python3-pyyaml | microdnf | rpm signature | yes
+envsubst | UBI package gettext | microdnf | rpm signature | yes
+awk | UBI package gawk | microdnf | rpm signature | yes
+GNU coreutils (date, base64, timeout, tee, sort, uniq, tr, cut, head, tail, wc, ls, cp, touch, mkdir, chmod, sleep, cat, echo, printf, test, true, false, pwd, df, uname, whoami) | UBI package coreutils-single (in base) | in base | rpm signature | yes
+grep, sed | UBI packages (in base) | in base | rpm signature | yes
+xargs | UBI package findutils | microdnf | rpm signature | yes
+
+# Not in the image on purpose (reason)
+openshift-install, openshift-install-fips | runs on the FIPS RHEL 9 bastion (module 2), not in the lab shell
+chronyc | runs on cluster nodes via oc debug node/... chroot /host
+lab, docker, podman | host-side commands
+falco | runs in the cluster; no module runs it from the shell
+syft, yq, helm | no module code block uses them

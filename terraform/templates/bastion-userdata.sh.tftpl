@@ -1,0 +1,153 @@
+#!/bin/bash
+# Bastion bootstrap (cloud-init user data). Rendered by Terraform templatefile().
+# Only the three template values (region, artifacts_bucket, ocp_channel) are
+# substituted. Shell variables below are written without braces on purpose.
+set -euo pipefail
+exec > >(tee -a /var/log/lab-bootstrap.log) 2>&1
+
+REGION="${region}"
+BUCKET="${artifacts_bucket}"
+CHANNEL="${ocp_channel}"
+
+dnf install -y jq tar curl unzip
+
+# Session Manager agent (skipped if the AMI already ships it).
+if ! systemctl list-unit-files | grep -q '^amazon-ssm-agent'; then
+  dnf install -y "https://s3.$REGION.amazonaws.com/amazon-ssm-$REGION/latest/linux_amd64/amazon-ssm-agent.rpm"
+fi
+systemctl enable --now amazon-ssm-agent
+
+# AWS CLI v2.
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+fi
+
+mkdir -p /var/lib/lab/cluster
+chmod 700 /var/lib/lab /var/lib/lab/cluster
+
+cat > /usr/local/bin/lab-install.sh <<'LABEOF'
+#!/bin/bash
+# Waits for install-config.yaml in the artifacts bucket, then runs
+# openshift-install-fips. Output goes to /var/log/lab-install.log (stream it
+# with: aws ssm start-session --document-name AWS-StartInteractiveCommand
+# --parameters command="tail -n +1 -F /var/log/lab-install.log").
+# Handoff keys in the bucket:
+#   install/install-config.yaml  in   (deleted from S3 once read)
+#   install/destroy              in   (marker: run destroy cluster)
+#   install/status               out  (installing | complete | failed:<rc> | destroyed)
+#   install/auth/kubeconfig      out
+#   install/auth/kubeadmin-password out
+set -uo pipefail
+# install-config.yaml carries the pull secret: nothing this script writes may be world-readable.
+umask 077
+BUCKET="__BUCKET__"
+CHANNEL="__CHANNEL__"
+WORK=/var/lib/lab
+DIR=$WORK/cluster
+LOG=/var/log/lab-install.log
+export AWS_DEFAULT_REGION="__REGION__"
+
+touch "$LOG"
+chmod 644 "$LOG"   # streamed by ssm-user; installer output is redacted below
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" | tee -a "$LOG"; }
+status() { echo "$1" | aws s3 cp - "s3://$BUCKET/install/status" --sse aws:kms >/dev/null; }
+
+if [ "$(cat /proc/sys/crypto/fips_enabled)" != "1" ]; then
+  log "FIPS mode is not enabled on this host; refusing to run the installer."
+  exit 1
+fi
+
+MIRROR="https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/$CHANNEL"
+
+ensure_tools() {
+  if ! command -v oc >/dev/null 2>&1; then
+    log "Downloading oc from $MIRROR"
+    curl -fsSL "$MIRROR/openshift-client-linux.tar.gz" | tar -xz -C /usr/local/bin oc kubectl || return 1
+  fi
+  if ! command -v openshift-install-fips >/dev/null 2>&1; then
+    local pull_from
+    pull_from=$(curl -fsSL "$MIRROR/release.txt" | awk '/^Pull From:/ {print $3}')
+    log "Extracting openshift-install-fips from $pull_from"
+    oc adm release extract --command=openshift-install-fips --from="$pull_from" \
+      --registry-config="$WORK/pull-secret.json" --to=/usr/local/bin || return 1
+  fi
+}
+
+do_create() {
+  cp "$WORK/install-config.yaml" "$DIR/install-config.yaml"
+  aws s3 rm "s3://$BUCKET/install/install-config.yaml" >/dev/null
+  # The lab appends one line:  pullSecret: '<json>'
+  sed -n "s/^pullSecret: '\(.*\)'\$/\1/p" "$DIR/install-config.yaml" > "$WORK/pull-secret.json"
+  chmod 600 "$WORK/pull-secret.json" "$DIR/install-config.yaml"
+  rm -f "$WORK/install-config.yaml"
+  status installing
+  if ensure_tools; then
+    # The installer prints the kubeadmin password in its last lines; keep it out of the log.
+    openshift-install-fips create cluster --dir "$DIR" --log-level=info 2>&1 |
+      sed -u -E 's/(password: ")[^"]*/\1[redacted]/I' | tee -a "$LOG"
+    rc=$${PIPESTATUS[0]}
+  else
+    rc=99
+  fi
+  if [ "$rc" = "0" ]; then
+    aws s3 cp "$DIR/auth/kubeconfig" "s3://$BUCKET/install/auth/kubeconfig" --sse aws:kms >/dev/null
+    aws s3 cp "$DIR/auth/kubeadmin-password" "s3://$BUCKET/install/auth/kubeadmin-password" --sse aws:kms >/dev/null
+    touch "$WORK/installed"
+    status complete
+  else
+    status "failed:$rc"
+  fi
+  rm -f "$WORK/install-config.yaml"
+}
+
+do_destroy() {
+  log "Destroy marker found; running destroy cluster"
+  ensure_tools || true
+  openshift-install-fips destroy cluster --dir "$DIR" --log-level=info 2>&1 | tee -a "$LOG"
+  aws s3 rm "s3://$BUCKET/install/destroy" >/dev/null
+  aws s3 rm "s3://$BUCKET/install/auth/" --recursive >/dev/null
+  rm -f "$WORK/installed"
+  status destroyed
+}
+
+log "lab-install ready; waiting for install/install-config.yaml in s3://$BUCKET"
+while true; do
+  if aws s3api head-object --bucket "$BUCKET" --key install/destroy >/dev/null 2>&1; then
+    do_destroy
+  elif [ ! -f "$WORK/installed" ] && aws s3 cp "s3://$BUCKET/install/install-config.yaml" "$WORK/install-config.yaml" >/dev/null 2>&1; then
+    do_create
+  fi
+  sleep 15
+done
+LABEOF
+sed -i -e "s|__BUCKET__|$BUCKET|" -e "s|__CHANNEL__|$CHANNEL|" -e "s|__REGION__|$REGION|" /usr/local/bin/lab-install.sh
+chmod 700 /usr/local/bin/lab-install.sh
+
+cat > /etc/systemd/system/lab-install.service <<'UNITEOF'
+[Unit]
+Description=Lab OpenShift FIPS installer runner
+After=network-online.target amazon-ssm-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lab-install.sh
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+systemctl daemon-reload
+systemctl enable lab-install.service
+
+# Turn FIPS mode on, then reboot. The service starts after the reboot and
+# refuses to run unless /proc/sys/crypto/fips_enabled is 1.
+if [ "$(cat /proc/sys/crypto/fips_enabled)" != "1" ]; then
+  fips-mode-setup --enable
+  systemctl reboot
+else
+  systemctl start lab-install.service
+fi
